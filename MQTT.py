@@ -1,4 +1,5 @@
 from twisted.internet.protocol import Protocol
+import random
 
 class MQTTProtocol(Protocol):
     buffer = bytearray()
@@ -104,7 +105,7 @@ class MQTTProtocol(Protocol):
             
         elif self.type == 0x0D << 4:
             # Pingresp
-            pass
+            self.pingRespReceived()
         
         elif self.type == 0x0E << 4:
             pass
@@ -116,6 +117,10 @@ class MQTTProtocol(Protocol):
     def connectionLost(self, reason):
         pass
     
+    def connectReceived(self, clientID, keepalive, willTopic,
+                        willMessage, willQoS, willRetain, cleanStart):
+        pass
+    
     def connackReceived(self, status):
         pass
         
@@ -125,8 +130,12 @@ class MQTTProtocol(Protocol):
     def pingReqReceived(self):
         pass        
     
+    def pingRespReceived(self):
+        pass
+    
     def connect(self, clientID, keepalive = 3000, willTopic = None,
-                willMessage = None, willQoS = 0, willRetain = False):
+                willMessage = None, willQoS = 0, willRetain = False,
+                cleanStart = True):
         header = bytearray()
         varHeader = bytearray()
         payload = bytearray()
@@ -136,9 +145,10 @@ class MQTTProtocol(Protocol):
         
         if willMessage is None or willTopic is None:
             # Clean start, no will message
-            varHeader.append( 0 << 2 | 1 << 1 )
+            varHeader.append( 0 << 2 | cleanStart << 1 )
         else: 
-            varHeader.append(willRetain << 5 | willQoS << 3 | 1 << 2 | 1 << 1)
+            varHeader.append(willRetain << 5 | willQoS << 3 
+                             | 1 << 2 | cleanStart << 1)
         
         varHeader.extend(self._encodeValue(keepalive/1000))
         
@@ -154,18 +164,23 @@ class MQTTProtocol(Protocol):
         self.transport.write(str(varHeader))
         self.transport.write(str(payload))
     
-    def publish(self, topic, message, qosLevel = 0):
-        """
-        Only supports QoS level 0 publishes
-        """
+    def publish(self, topic, message, qosLevel = 0, messageId = None):
+
         header = bytearray()
         varHeader = bytearray()
         payload = bytearray()
         
-        # Type = publish, QoS = 0
-        header.append(0x03 << 4 | 0x00 << 1)
+        # Type = publish
+        header.append(0x03 << 4 | qosLevel << 1)
         
         varHeader.extend(self._encodeString(topic))
+        
+        if qosLevel > 0:
+            if messageId is not None:
+                varHeader.extend(self._encodeValue(messageId))
+            else:
+                varHeader.extend(self._encodeValue(random.randint(1, 0xFFFF)))
+        
         payload.extend(message)
         
         header.extend(self._encodeLength(len(varHeader) + len(payload)))
@@ -174,8 +189,7 @@ class MQTTProtocol(Protocol):
         self.transport.write(str(varHeader))
         self.transport.write(str(payload))
         
-    def subscribe(self, topic, requestedQoS = 0):
-
+    def subscribe(self, topic, requestedQoS = 0, messageId = None):
         """
         Only supports QoS = 0 subscribes
         Only supports one subscription per message
@@ -187,11 +201,13 @@ class MQTTProtocol(Protocol):
         # Type = subscribe, QoS = 1
         header.append(0x08 << 4 | 0x01 << 1)
         
-        varHeader.extend(self._encodeValue(self.messageID))
-        self.messageID += 1
+        if messageId is None:
+            varHeader.extend(self._encodeValue(random.randint(1, 0xFFFF)))
+        else:
+            varHeader.extend(self._encodeValue(messageId))
         
         payload.extend(self._encodeString(topic))
-        payload.append(0)
+        payload.append(requestedQoS)
         
         header.extend(self._encodeLength(len(varHeader) + len(payload)))
         
@@ -199,15 +215,17 @@ class MQTTProtocol(Protocol):
         self.transport.write(str(varHeader))
         self.transport.write(str(payload))
     
-    def unsubscribe(self, topic):
+    def unsubscribe(self, topic, messageId = None):
         header = bytearray()
         varHeader = bytearray()
         payload = bytearray
         
-        header.append(0x0A << 4 | 0x01 < 1)
+        header.append(0x0A << 4 | 0x01 << 1)
         
-        varHeader.extend(self._encodeValue(self.messageID))
-        self.messageID += 1
+        if messageId is not None:
+            varHeader.extend(self._encodeValue(self.messageID))
+        else:
+            varHeader.extend(self._encodeValue(random.randint(1, 0xFFFF)))
         
         payload.extend(self._encodeString(topic))
         
@@ -218,10 +236,18 @@ class MQTTProtocol(Protocol):
         self.transport.write(str(payload))
     
     def pingRequest(self):
-        self.transport.write(str(0x0C << 4))
+        header = bytearray()
+        header.append(0x0C << 4)
+        header.extend(self._encodeLength(0))
+        
+        self.transport.write(str(header))
     
     def disconnect(self):
-        self.transport.write(str(0x0E << 4))
+        header = bytearray()
+        header.append(0x0E << 4)
+        header.extend(self._encodeLength(0))
+        
+        self.transport.write(str(header))
     
     def _encodeString(self, string):
         encoded = bytearray()
