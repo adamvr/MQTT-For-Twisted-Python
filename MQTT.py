@@ -2,11 +2,13 @@ from twisted.internet.protocol import Protocol
 import random
 
 class MQTTProtocol(Protocol):
+    _packetTypes = { 0x00: "null",    0x01: "connect",     0x02: "connack",
+                     0x03: "publish", 0x04: "puback",      0x04: "pubrec",
+                     0x05: "pubrel",  0x06: "pubcomp",     0x07: "subscribe",
+                     0x08: "suback",  0x09: "unsubscribe", 0x0A: "unsuback",
+                     0x0B: "pingreq", 0x0C: "pingresp",    0x0D: "disconnect" }
+    
     buffer = bytearray()
-    type = None
-    qos = None
-    length = None
-    messageID = 1
     
     def dataReceived(self, data):
         self._accumulatePacket(data)
@@ -14,8 +16,10 @@ class MQTTProtocol(Protocol):
     def _accumulatePacket(self, data):
         self.buffer.extend(data)
         
+        length = None
+        
         while len(self.buffer):
-            if self.length is None:
+            if length is None:
                 # Start on a new packet
                 
                 # Haven't got enough data to start a new packet,
@@ -23,93 +27,196 @@ class MQTTProtocol(Protocol):
                 if len(self.buffer) < 2: break 
                 
                 lenLen = 1
+                # Calculate the length of the length field
                 while lenLen < len(self.buffer):
                     if not self.buffer[lenLen] & 0x80: break
                     lenLen += 1
                 
                 # We still haven't got all of the remaining length field
-                if lenLen < len(self.buffer) and self.buffer[lenLen] & 0x80: return
+                if lenLen < len(self.buffer) and self.buffer[lenLen] & 0x80: 
+                    return
                 
-                self.type = self.buffer[0] & 0xF0
-                self.qos = self.buffer[0] & 0x06
-                self.length = self._decodeLength(self.buffer[1:1+lenLen])
-                self.buffer = self.buffer[lenLen+1:]
+                length = self._decodeLength(self.buffer[1:1+lenLen])
                 
-            if len(self.buffer) >= self.length:
+            if len(self.buffer) >= length:
                 chunk = self.buffer[:self.length]
                 self._processPacket(chunk)
                 self.buffer = self.buffer[self.length:]
-                self.length = None
-                self.type = None
-                self.qos = None
+                length = None
+
             else:
                 break
                 
     def _processPacket(self, packet):
-        if self.type == 0x01 << 4:
-            # Connect
-            pass
-        elif self.type == 0x02 << 4:
-            # Connack
-            status = packet[1] 
-            self.connackReceived(status)
-        elif self.type == 0x03 << 4:
-            # Publish
-            topicLen = packet[0] * 256 + packet[1]
+        try:
+            type = self._packetTypes[packet[0] & 0xF0 >> 4]
+            dup = packet[0] & 0x08 == 0x08
+            qos = packet[0] & 0x06 >> 1
+            retain = packet[0] & 0x01 == 0x01
+        except:
+            # Invalid packet type, throw away this packet
+            print "Invalid packet type"
+            return
+        
+        # Strip the fixed header
+        lenLen = 1
+        while packet[lenLen] & 0x80:
+            lenLen += 1
+        
+        packet = packet[lenLen:]
+        
+        # Get the appropriate handler function
+        packetHandler = getattr(self, "_event_%s" % type, None)
+        
+        if packetHandler:
+            packetHandler(packet, qos, dup, retain)
+        else:
+            # Rocks fall, everyone dies
+            print "Invalid packet handler"
+            return
+        
+    def _event_connect(self, packet, qos, dup, retain):
+        # Strip the protocol name and version number
+        packet = packet[len("06MQisdp3"):]
+        
+        # Extract the connect flags
+        willRetain = packet[0] & 0x20 == 0x20
+        willQos = packet[0] & 0x18 >> 3
+        willFlag = packet[0] & 0x04 == 0x04
+        cleanStart = packet[0] & 0x02 == 0x02
+        
+        packet = packet[1:]
+        
+        # Extract the keepalive period
+        keepalive = self._decodeValue(packet[:2])
+        packet = packet[2:]
+        
+        # Extract the client id
+        clientID = self._decodeString(packet)
+        packet = packet[len(clientID) + 2:]
+        
+        if willFlag:
+            # Extract the will topic
+            willTopic = self._decodeString(packet)
+            packet = packet[len(willTopic) + 2:]
+            
+            # Extract the will message
+            # Whatever remains is the will message
+            willMessage = packet
+          
+        
+        
+        self.connectReceived(clientID, keepalive, willTopic,
+                             willMessage, willQos, willRetain, 
+                             cleanStart)
+        
+    def _event_connack(self, packet, qos, dup, retain):
+        # Return the status field
+        self.connackReceived(packet[1])
+    
+    def _event_publish(self, packet, qos, dup, retain):
+        # Extract the topic name
+        topic = self._decodeString(packet)
+        packet = packet[len(topic) + 2:]
+        
+        # Extract the message ID
+        messageId = self._decodeValue(packet[:2])
+        packet = packet[2:]
+        
+        # Extract the message
+        # Whatever remains is the message
+        message = packet
+        
+        self.publishReceived(topic, message, qos, dup, retain, messageId)
+        
+    def _event_puback(self, packet, qos, dup, retain):
+        # Extract the message ID
+        messageId = self._decodeValue(packet[:2])
+        self.pubackReceived(messageId)
+        
+    def _event_pubrec(self, packet, qos, dup, retain):
+        # Extract the message ID
+        messageId = self._decodeValue(packet[:2])
+        self.pubrecReceived(messageId)
+        
+    def _event_pubrel(self, packet, qos, dup, retain):
+        # Extract the message ID
+        messageId = self._decodeValue(packet[:2])
+        self.pubrelReceived(messageId)
+        
+    def _event_pubcomp(self, packet, qos, dup, retain):
+        # Extract the message ID
+        messageId = self._decodeValue(packet[:2])
+        self.pubcompReceived(messageId)
+        
+    def _event_subscribe(self, packet, qos, dup, retain):
+        # Extract the message ID
+        messageId = self._decodeValue(packet[:2])
+        packet = packet[2:]
+        
+        # Extract the requested topics and their QoS levels
+        topics = []
+        
+        while len(packet):
+            # Get the topic name
             topic = self._decodeString(packet)
-            packet = packet[2:]
-            packet = packet[topicLen:]
+            packet = packet[len(topic) + 2:]
             
-            if self.qos == 0x00 << 1:    
-                payload = bytearray(packet)
-            else:
-                payload = bytearray(packet[:-2])
-                
-            self.publishReceived(str(topic), str(payload))    
+            # Get the QoS level
+            qos = packet[0]
+            packet = packet[1:]
             
-        elif self.type == 0x04 << 4:
-            # Puback
-            pass
+            # Add them to the list of (topic, qos)s
+            topics.append((topic, qos))
         
-        elif self.type == 0x05 << 4:
-            # Pubrec
-            pass
-        
-        elif self.type == 0x06 << 4:
-            # Pubrel
-            pass
-        
-        elif self.type == 0x07 << 4:
-            # Pubcomp
-            pass
-        
-        elif self.type == 0x08 << 4:
-            # Subscribe
-            pass
-        
-        elif self.type == 0x09 << 4:
-            # Suback
-            pass
-        
-        elif self.type == 0x0A << 4:
-            # Unsubscribe
-            pass
-        
-        elif self.type == 0x0B <<4:
-            # Unsuback
-            pass
-        
-        elif self.type == 0x0C << 4:
-            # Pingreq
-            self.pingReqReceived()
+        self.subscribeReceived(topics, messageId)
             
-        elif self.type == 0x0D << 4:
-            # Pingresp
-            self.pingRespReceived()
+    def _event_suback(self, packet, qos, dup, retain):
+        # Extract the message ID
+        messageId = self._decodeValue(packet[:2])
+        packet = packet[2:]
         
-        elif self.type == 0x0E << 4:
-            pass
-            # Disconnect
+        # Extract the granted QoS levels
+        grantedQos = []
+        
+        while len(packet):
+            grantedQos.append(packet[0])
+            packet = packet[1:]
+        
+        self.subackReceived(grantedQos, messageId)
+            
+    def _event_unsubscribe(self, packet, qos, dup, retain):
+        # Extract the message ID
+        messageId = self._decodeValue(packet[:2])
+        packet = packet[2:]
+    
+        # Extract the unsubscribing topics
+        topics = []
+        
+        while len(packet):
+            # Get the topic name
+            topic = self._decodeString(packet)
+            packet = packet[len(topic) + 2:]
+            
+            # Add it to the list of topics
+            topics.append(topic)
+        
+        self.unsubscribeReceived(topics, messageId)
+    
+    def _event_unsuback(self, packet, qos, dup, retain):
+        # Extract the message ID
+        messageId = self._decodeValue(packet[:2])
+        self.unsubackReceived(messageId)
+    
+    def _event_pingreq(self, packet, qos, dup, retain):
+        self.pingreqReceived()
+    
+    def _event_pingresp(self, packet, qos, dup, retain):
+        self.pingrespReceived()
+    
+    def _event_disconnect(self, packet, qos, dup, retain):
+        self.disconnectReceived()
+        
         
     def connectionMade(self):
         pass
@@ -124,13 +231,41 @@ class MQTTProtocol(Protocol):
     def connackReceived(self, status):
         pass
         
-    def publishReceived(self, topic, message):
+    def publishReceived(self, topic, message, qos = 0, 
+                        dup = False, retain = False, messageId = 1):
         pass
     
-    def pingReqReceived(self):
+    def pubackReceived(self, messageId):
+        pass
+    
+    def pubrecReceived(self, messageId):
+        pass
+    
+    def pubrelReceived(self, messageId):
+        pass
+    
+    def pubcompReceived(self, messageId):
+        pass
+    
+    def subscribeReceived(self, topics, messageId):
+        pass
+    
+    def subackReceived(self, grantedQos, messageId):
+        pass
+    
+    def unsubscribeReceived(self, topics, messageId):
+        pass
+    
+    def unsubackReceived(self, messageId):
+        pass
+    
+    def pingreqReceived(self):
         pass        
     
-    def pingRespReceived(self):
+    def pingrespReceived(self):
+        pass
+    
+    def disconnectReceived(self):
         pass
     
     def connect(self, clientID, keepalive = 3000, willTopic = None,
@@ -290,4 +425,14 @@ class MQTTProtocol(Protocol):
             multiplier *= 0x80
         
         return length
+    
+    def _decodeValue(self, valueArray):
+        value = 0
+        multiplier = 1
+        for i in valueArray[::-1]:
+            value += i * multiplier
+            multiplier = multiplier << 8
+        
+        return value
+    
         
