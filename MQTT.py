@@ -3,10 +3,10 @@ import random
 
 class MQTTProtocol(Protocol):
     _packetTypes = { 0x00: "null",    0x01: "connect",     0x02: "connack",
-                     0x03: "publish", 0x04: "puback",      0x04: "pubrec",
-                     0x05: "pubrel",  0x06: "pubcomp",     0x07: "subscribe",
-                     0x08: "suback",  0x09: "unsubscribe", 0x0A: "unsuback",
-                     0x0B: "pingreq", 0x0C: "pingresp",    0x0D: "disconnect" }
+                     0x03: "publish", 0x04: "puback",      0x05: "pubrec",
+                     0x06: "pubrel",  0x07: "pubcomp",     0x08: "subscribe",
+                     0x09: "suback",  0x0A: "unsubscribe", 0x0B: "unsuback",
+                     0x0C: "pingreq", 0x0D: "pingresp",    0x0E: "disconnect" }
     
     buffer = bytearray()
     
@@ -36,12 +36,12 @@ class MQTTProtocol(Protocol):
                 if lenLen < len(self.buffer) and self.buffer[lenLen] & 0x80: 
                     return
                 
-                length = self._decodeLength(self.buffer[1:1+lenLen])
+                length = self._decodeLength(self.buffer[1:])
                 
             if len(self.buffer) >= length:
-                chunk = self.buffer[:self.length]
+                chunk = self.buffer[:length + lenLen + 1]
                 self._processPacket(chunk)
-                self.buffer = self.buffer[self.length:]
+                self.buffer = self.buffer[length + lenLen + 1:]
                 length = None
 
             else:
@@ -49,10 +49,10 @@ class MQTTProtocol(Protocol):
                 
     def _processPacket(self, packet):
         try:
-            type = self._packetTypes[packet[0] & 0xF0 >> 4]
-            dup = packet[0] & 0x08 == 0x08
-            qos = packet[0] & 0x06 >> 1
-            retain = packet[0] & 0x01 == 0x01
+            type = self._packetTypes[(packet[0] & 0xF0) >> 4]
+            dup = (packet[0] & 0x08) == 0x08
+            qos = (packet[0] & 0x06) >> 1
+            retain = (packet[0] & 0x01) == 0x01
         except:
             # Invalid packet type, throw away this packet
             print "Invalid packet type"
@@ -63,9 +63,10 @@ class MQTTProtocol(Protocol):
         while packet[lenLen] & 0x80:
             lenLen += 1
         
-        packet = packet[lenLen:]
+        packet = packet[lenLen+1:]
         
         # Get the appropriate handler function
+        print "_event_%s" % type
         packetHandler = getattr(self, "_event_%s" % type, None)
         
         if packetHandler:
@@ -86,14 +87,17 @@ class MQTTProtocol(Protocol):
         cleanStart = packet[0] & 0x02 == 0x02
         
         packet = packet[1:]
-        
         # Extract the keepalive period
         keepalive = self._decodeValue(packet[:2])
         packet = packet[2:]
-        
+
         # Extract the client id
         clientID = self._decodeString(packet)
         packet = packet[len(clientID) + 2:]
+
+        # Extract the will topic and message, if applicable
+        willTopic = None
+        willMessage = None
         
         if willFlag:
             # Extract the will topic
@@ -102,8 +106,7 @@ class MQTTProtocol(Protocol):
             
             # Extract the will message
             # Whatever remains is the will message
-            willMessage = packet
-          
+            willMessage = packet  
         
         
         self.connectReceived(clientID, keepalive, willTopic,
@@ -112,16 +115,18 @@ class MQTTProtocol(Protocol):
         
     def _event_connack(self, packet, qos, dup, retain):
         # Return the status field
-        self.connackReceived(packet[1])
+        self.connackReceived(packet[0])
     
     def _event_publish(self, packet, qos, dup, retain):
         # Extract the topic name
         topic = self._decodeString(packet)
         packet = packet[len(topic) + 2:]
         
-        # Extract the message ID
-        messageId = self._decodeValue(packet[:2])
-        packet = packet[2:]
+        # Extract the message ID if appropriate
+        messageId = None
+        if qos > 0:
+            messageId = self._decodeValue(packet[:2])
+            packet = packet[2:]
         
         # Extract the message
         # Whatever remains is the message
@@ -232,7 +237,7 @@ class MQTTProtocol(Protocol):
         pass
         
     def publishReceived(self, topic, message, qos = 0, 
-                        dup = False, retain = False, messageId = 1):
+                        dup = False, retain = False, messageId = None):
         pass
     
     def pubackReceived(self, messageId):
@@ -298,15 +303,26 @@ class MQTTProtocol(Protocol):
         self.transport.write(str(header))
         self.transport.write(str(varHeader))
         self.transport.write(str(payload))
-    
-    def publish(self, topic, message, qosLevel = 0, messageId = None):
+        
+    def connack(self, status):
+        header = bytearray()
+        payload = bytearray()
+        
+        header.append(0x02 << 4)
+        payload.append(status)
+        
+        header.extend(self._encodeLength(len(payload)))
+        self.transport.write(str(header))
+        self.transport.write(str(payload))
+        
+    def publish(self, topic, message, qosLevel = 0, retain = False, dup = False, messageId = None):
 
         header = bytearray()
         varHeader = bytearray()
         payload = bytearray()
         
         # Type = publish
-        header.append(0x03 << 4 | qosLevel << 1)
+        header.append(0x03 << 4 | dup << 3 | qosLevel << 1 | retain)
         
         varHeader.extend(self._encodeString(topic))
         
@@ -324,6 +340,54 @@ class MQTTProtocol(Protocol):
         self.transport.write(str(varHeader))
         self.transport.write(str(payload))
         
+    def puback(self, messageId):
+        header = bytearray()
+        varHeader = bytearray()
+        
+        header.append(0x04 << 4)
+        varHeader.extend(self._encodeValue(messageId))
+        
+        header.extend(self._encodeLength(len(varHeader)))
+        
+        self.transport.write(str(header))
+        self.transport.write(str(varHeader))
+        
+    def pubrec(self, messageId):
+        header = bytearray()
+        varHeader = bytearray()
+        
+        header.append(0x05 << 4)
+        varHeader.extend(self._encodeValue(messageId))
+        
+        header.extend(self._encodeLength(len(varHeader)))
+        
+        self.transport.write(str(header))
+        self.transport.write(str(varHeader))
+        
+    def pubrel(self, messageId):
+        header = bytearray()
+        varHeader = bytearray()
+        
+        header.append(0x06 << 4)
+        varHeader.extend(self._encodeValue(messageId))
+        
+        header.extend(self._encodeLength(len(varHeader)))
+        
+        self.transport.write(str(header))
+        self.transport.write(str(varHeader))
+        
+    def pubcomp(self, messageId):
+        header = bytearray()
+        varHeader = bytearray()
+        
+        header.append(0x07 << 4)
+        varHeader.extend(self._encodeValue(messageId))
+        
+        header.extend(self._encodeLength(len(varHeader)))
+        
+        self.transport.write(str(header))
+        self.transport.write(str(varHeader))
+
     def subscribe(self, topic, requestedQoS = 0, messageId = None):
         """
         Only supports QoS = 0 subscribes
@@ -343,6 +407,23 @@ class MQTTProtocol(Protocol):
         
         payload.extend(self._encodeString(topic))
         payload.append(requestedQoS)
+        
+        header.extend(self._encodeLength(len(varHeader) + len(payload)))
+        
+        self.transport.write(str(header))
+        self.transport.write(str(varHeader))
+        self.transport.write(str(payload))
+        
+    def suback(self, grantedQos, messageId):
+        header = bytearray()
+        varHeader = bytearray()
+        payload = bytearray()
+        
+        header.append(0x09 << 4)
+        varHeader.extend(self._encodeValue(messageId))
+        
+        for i in grantedQos:
+            payload.append(i)
         
         header.extend(self._encodeLength(len(varHeader) + len(payload)))
         
@@ -370,13 +451,32 @@ class MQTTProtocol(Protocol):
         self.transport.write(str(varHeader))
         self.transport.write(str(payload))
     
-    def pingRequest(self):
+    def unsuback(self, messageId):
+        header = bytearray()
+        varHeader = bytearray()
+        
+        header.append(0x0B << 4)
+        varHeader.extend(self._encodeValue(messageId))
+        
+        header.extend(self._encodeLength(len(varHeader)))
+        
+        self.transport.write(str(header))
+        self.transport.write(str(varHeader))
+            
+    def pingreq(self):
         header = bytearray()
         header.append(0x0C << 4)
         header.extend(self._encodeLength(0))
         
         self.transport.write(str(header))
     
+    def pingresp(self):
+        header = bytearray()
+        header.append(0x0D << 4)
+        header.extend(self._encodeLength(0))
+        
+        self.transport.write(str(header))
+        
     def disconnect(self):
         header = bytearray()
         header.append(0x0E << 4)
@@ -423,6 +523,9 @@ class MQTTProtocol(Protocol):
         for i in lengthArray:
             length += (i & 0x7F) * multiplier
             multiplier *= 0x80
+            
+            if (i & 0x80) != 0x80:
+                break
         
         return length
     
@@ -434,5 +537,8 @@ class MQTTProtocol(Protocol):
             multiplier = multiplier << 8
         
         return value
+
+
+class MQTTClient(MQTTProtocol):
     
         
