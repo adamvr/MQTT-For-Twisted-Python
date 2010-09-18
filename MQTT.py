@@ -66,7 +66,6 @@ class MQTTProtocol(Protocol):
         packet = packet[lenLen+1:]
         
         # Get the appropriate handler function
-        print "_event_%s" % type
         packetHandler = getattr(self, "_event_%s" % type, None)
         
         if packetHandler:
@@ -130,7 +129,7 @@ class MQTTProtocol(Protocol):
         
         # Extract the message
         # Whatever remains is the message
-        message = packet
+        message = str(packet)
         
         self.publishReceived(topic, message, qos, dup, retain, messageId)
         
@@ -540,5 +539,40 @@ class MQTTProtocol(Protocol):
 
 
 class MQTTClient(MQTTProtocol):
+    
+    def __init__(self, clientId = None, keepalive = None, willQos = 0, 
+                 willTopic = None, willMessage = None, willRetain = False):
+        
+        if clientId is not None:
+            self.clientId = clientId
+        else:
+            self.clientId = "Twisted%i" % random.randint(1, 0xFFFF)
+        
+        if keepalive is not None:
+            self.keepalive = keepalive
+        else:
+            self.keepalive = 3000
+            
+        self.willQos = willQos
+        self.willTopic = willTopic
+        self.willMessage = willMessage
+        self.willRetain = willRetain
+        
+    
+    def connectionMade(self):
+        self.connect(self.clientId, self.keepalive, self.willTopic, self.willMessage, 
+                     self.willQos, self.willRetain, True)
+    
+    def connackReceived(self, status):
+        if status == 0:
+            self.mqttConnected()
+        else:
+            # Error
+            pass
+            
+    def mqttConnected(self):
+        pass
+    
+        
     
         
